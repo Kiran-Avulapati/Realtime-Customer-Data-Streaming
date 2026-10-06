@@ -1,0 +1,221 @@
+name: kafka-airflow-local
+
+services:
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.4.0
+    container_name: zookeeper
+    hostname: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    healthcheck:
+      test: ["CMD", "bash", "-c", "echo 'ruok' | nc localhost 2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    ports:
+      - "2181:2181"
+    networks:
+      - confluent
+
+  broker:
+    image: confluentinc/cp-server:7.4.0
+    container_name: broker
+    hostname: broker
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,PLAINTEXT_HOST://0.0.0.0:9092,EXTERNAL://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://broker:29092,PLAINTEXT_HOST://localhost:9092,EXTERNAL://${KAFKA_EXTERNAL_ADVERTISED}
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+
+      KAFKA_CONFLUENT_LICENSE_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_CONFLUENT_BALANCER_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_CONFLUENT_SCHEMA_REGISTRY_URL: http://schema-registry:8081
+
+      KAFKA_JMX_HOSTNAME: localhost
+      KAFKA_JMX_PORT: 9101
+
+      KAFKA_METRIC_REPORTERS: io.confluent.metrics.reporter.ConfluentMetricsReporter
+      CONFLUENT_METRICS_ENABLE: "false"
+      CONFLUENT_METRICS_REPORTER_BOOTSTRAP_SERVERS: broker:29092
+      CONFLUENT_METRICS_REPORTER_TOPIC_REPLICAS: 1
+      CONFLUENT_SUPPORT_CUSTOMER_ID: anonymous
+
+    healthcheck:
+      test: ["CMD", "bash", "-c", "nc -z localhost 9092"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    ports:
+      - "9092:9092"
+      - "9093:9093"
+      - "9101:9101"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    networks:
+      - confluent
+
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.4.0
+    container_name: schema-registry
+    hostname: schema-registry
+    depends_on:
+      broker:
+        condition: service_healthy
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: broker:29092
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    ports:
+      - "8081:8081"
+    networks:
+      - confluent
+
+  control-center:
+    image: confluentinc/cp-enterprise-control-center:7.4.0
+    container_name: control-center
+    hostname: control-center
+    depends_on:
+      broker:
+        condition: service_healthy
+      schema-registry:
+        condition: service_healthy
+    environment:
+      CONTROL_CENTER_BOOTSTRAP_SERVERS: broker:29092
+      CONTROL_CENTER_SCHEMA_REGISTRY_URL: http://schema-registry:8081
+      CONTROL_CENTER_REPLICATION_FACTOR: 1
+      CONTROL_CENTER_INTERNAL_TOPICS_PARTITIONS: 1
+      CONTROL_CENTER_MONITORING_INTERCEPTOR_TOPIC_PARTITIONS: 1
+      CONFLUENT_METRICS_ENABLE: "false"
+      CONFLUENT_METRICS_TOPIC_REPLICATION: 1
+      PORT: 9021
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9021/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    ports:
+      - "9021:9021"
+    networks:
+      - confluent
+
+  postgres:
+    image: postgres:14.0
+    container_name: airflow-postgres
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow -d airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    logging:
+      options:
+        max-size: 10m
+        max-file: "3"
+    volumes:
+      - airflow-postgres-data:/var/lib/postgresql/data
+    networks:
+      - confluent
+
+  airflow-init:
+    image: apache/airflow:2.6.0-python3.9
+    container_name: airflow-init
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./producer_raw.py:/opt/airflow/producer_raw.py
+      - ./requirements.txt:/opt/airflow/requirements.txt
+    command: >
+      bash -c "
+      pip install --no-cache-dir -r /opt/airflow/requirements.txt &&
+      airflow db upgrade &&
+      airflow users create
+        --username admin
+        --firstname Admin
+        --lastname User
+        --role Admin
+        --email admin@example.com
+        --password admin || true
+      "
+    networks:
+      - confluent
+
+  webserver:
+    image: apache/airflow:2.6.0-python3.9
+    container_name: airflow-webserver
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__WEBSERVER__SECRET_KEY: this_is_a_very_secured_key
+    command: >
+      bash -c "
+      pip install --no-cache-dir -r /opt/airflow/requirements.txt &&
+      airflow webserver
+      "
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./producer_raw.py:/opt/airflow/producer_raw.py
+      - ./requirements.txt:/opt/airflow/requirements.txt
+    ports:
+      - "8080:8080"
+    networks:
+      - confluent
+
+  scheduler:
+    image: apache/airflow:2.6.0-python3.9
+    container_name: airflow-scheduler
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__SCHEDULER__MIN_FILE_PROCESS_INTERVAL: 5
+      AIRFLOW__WEBSERVER__SECRET_KEY: this_is_a_very_secured_key
+    command: >
+      bash -c "
+      pip install --no-cache-dir -r /opt/airflow/requirements.txt &&
+      airflow scheduler
+      "
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./producer_raw.py:/opt/airflow/producer_raw.py
+      - ./requirements.txt:/opt/airflow/requirements.txt
+    networks:
+      - confluent
+
+networks:
+  confluent:
+    driver: bridge
+
+volumes:
+  kafka-data:
+  airflow-postgres-data:
